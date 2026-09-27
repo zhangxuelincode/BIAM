@@ -41,6 +41,7 @@ Key design points:
 - **Interpretable additive structure**: each feature contributes through a learnable shape function built on hinge bases located at data quantiles.
 - **First-order bilevel optimization** (Eq. 4–6): a differentiable *virtual step* makes the upper-level hypergradient cheap — no second-order derivatives.
 - **Strong extrapolation**: piecewise-linear hinge shape functions extrapolate far better than piecewise-constant alternatives.
+- **BIAM² second-order extension**: gated rank-R pairwise interaction surfaces `F_jk(x_j,x_k) = Σ_r u_jr(x_j)·u_kr(x_k)` built on the *same* hinge basis. Zero-initialized gates with an ℓ0 penalty keep pairs switched off unless the data support them, so the model degrades gracefully to BIAM when no interaction exists, and each pair reports an interpretable strength `s_jk = |γ̄_jk|·‖F_jk‖_F` for interaction discovery (interaction-ranking AUPRC).
 
 ## 🔧 Installation
 
@@ -147,8 +148,17 @@ BIAM/
 │   ├── biam_config.py            # Central configuration + validation
 │   └── biam_logger.py            # Structured logging
 ├── visualization/                # Shape functions, feature importance, training curves
-└── tests/                        # Unit / functional / simulation / performance tests
+├── experiments/                  # Paper experiment scripts (stress tests, plots, interpretability)
+│   ├── run_new_experiments.py    # Synthetic stress-test protocol (noise families, extremes)
+│   ├── run_extension_experiments.py  # Extended regimes & robust baselines
+│   ├── run_biam2_experiments.py  # BIAM² pair-interaction protocol (planted interactions, AUPRC, EBM/CatBoost)
+│   ├── plot_new_results.py / plot_extension_results.py  # Result figures
+│   ├── plot_biam2_analysis.py    # BIAM² interaction figures (pair MSE, recovery, surfaces)
+│   ├── interpretability_analysis.py  # Interpretability figures (main effects, missingness offsets, surfaces)
+│   └── generate_summary_csv.py   # CSV summary of all runs
+├── tests/                        # Unit / functional / simulation / performance tests
 ```
+
 
 ### The Additive Model (Eq. 1)
 
@@ -182,6 +192,53 @@ Following the simulation protocol of the paper (§4.1), `BIAMDataGenerator` repr
 | **Missing values** | MCAR / MAR / MNAR masking at ratio `missing_ratio` | Train / Val / Test |
 | **Clean test labels** | Natural class distribution, no flipped labels | Test |
 
+## 📊 Interpretability Analysis
+
+`experiments/interpretability_analysis.py` produces the qualitative figures of the paper: because BIAM is additive, every prediction decomposes into interpretable parts — per-feature shape functions, missing-indicator offsets, and missingness–feature interaction surfaces. The script extracts each part directly from the trained model and compares it against the ground truth on synthetic data.
+
+```bash
+# All four figures (synthetic + real), PDF for the paper and PNG for preview
+python experiments/interpretability_analysis.py
+
+# Only the real-data figure; only the synthetic figures
+python experiments/interpretability_analysis.py --skip-synth
+python experiments/interpretability_analysis.py --skip-real
+```
+
+| Figure | What it shows |
+|--------|---------------|
+| `fig_interp_main_clean` | Ground-truth vs. BIAM vs. NAM shape functions on clean synthetic data (8 informative features) |
+| `fig_interp_main_outlier` | Same comparison under 10% label outliers — shape recovery survives the corruption |
+| `fig_interp_missing` | Recovery of the MNAR missing-indicator offsets $\phi_j$ and a missingness–feature conditional response surface vs. the Bayes surface |
+| `fig_interp_real` | Contribution curves of the top continuous features on the UCI Adult census data (logit scale) |
+
+Outputs are written to `exp/interpretability/` (each figure as `.pdf` + `.png`), together with a `diagnostics.json` that records the test MSE / accuracy and the per-feature correlation between fitted and true curves.
+
+## 🧩 BIAM² Interaction Experiments
+
+`experiments/run_biam2_experiments.py` implements the pair-interaction benchmark inspired by the AG-NAM protocol: planted pairwise interactions (product, sine-product, tanh-product) on top of additive components, null (no-interaction) controls, MCAR/MAR/MNAR corruption, and an interaction-discovery metric (ranking AUPRC over the 45 candidate pairs). EBM and CatBoost are included as interaction-aware baselines.
+
+```bash
+# Regression (E6) + classification (E7) blocks; appends to exp/results_biam2_E{6,7}.csv
+python experiments/run_biam2_experiments.py
+
+# Interaction analysis figures: pair-wise MSE, recovery heatmap + AUPRC, fitted surfaces
+python experiments/plot_biam2_analysis.py
+```
+
+Figures are written to `exp/biam2/` and copied to the paper's `images/` directory (`.pdf` + `.png`).
+
+#### Two gate schedules
+
+The gated extension ships with **two operating points of the same algorithm** (see §3.4/§7 of the paper and the comment block in `utils/biam_config.py`):
+
+| Schedule | Settings | Used for | Rationale |
+|----------|----------|----------|-----------|
+| **Robust** (default) | `pair_warmup_epochs=10`, `pair_gate_lr_scale=0.3`, `lambda_pair_l0=5e-2`, `lambda_pair_l2=1e-2` | Additive stress tests (E1–E5): corrupted labels, no interaction guaranteed | Reluctant opening keeps gates closed on corruption; calibrated via `experiments/calibrate_pair_reg.py` (E1/outlier30 MSE 0.36 vs BIAM 1.57) |
+| **Discovery** | `pair_warmup_epochs=0`, `pair_gate_lr_scale=1.0`, `lambda_pair_l0=l2=0` | Planted-interaction benchmarks (E6/E7) | The protocol asserts informative pairs exist, so gates are free to lock on; recovers pairs at AUPRC 0.54–0.87 |
+
+The two schedules are **not interchangeable**: `experiments/diag_eager_gates.py` shows that the discovery schedule opens gates on the corrupted minority under extreme label corruption (outlier30 MSE ≈ 52), which is precisely the failure mode the robust schedule prevents.
+
 ## 🔬 Ablation Variants
 
 | Variant | Switch | What is removed |
@@ -209,6 +266,8 @@ All behaviour is controlled via `utils/biam_config.py` (overridable through CLI 
 | `use_bilevel` | `True` | `False` disables bilevel reweighting (BIAM-B) |
 | `use_missing_interactions` | `True` | `False` removes missing × feature interactions (BIAM-I) |
 | `lambda_l2` / `lambda_l0` | 1e-3 / 1e-4 | Smoothness / sparsity penalties on shape functions |
+| `lambda_pair_l2` / `lambda_pair_l0` | 1e-2 / 5e-2 | Penalties on the BIAM² pair gates γ (robust schedule) |
+| `pair_warmup_epochs` / `pair_gate_lr_scale` | 10 / 0.3 | Robust gate schedule: warm-up freeze and gate learning-rate scale |
 | `upper_lr` / `lower_lr` | 0.1 / 0.05 | Upper- (θ) and lower-level (w) learning rates |
 | `epochs` / `batch_size` | 200 / 64 | Training schedule |
 | `seed` | 42 | Global random seed |
@@ -234,9 +293,8 @@ python run_tests.py
 
 ## ☑️ Todo List
 
-- [ ] Real-dataset benchmarks (ADNI, UCI Adult, Credit)
+- [x] Shape-function visualization for the interaction terms (`experiments/interpretability_analysis.py`)
 - [ ] GPU acceleration & mixed-precision training
-- [ ] Shape-function visualization for the interaction terms
 - [ ] Automatic hyperparameter search for the bilevel learning rates
 
 ## 🪪 License

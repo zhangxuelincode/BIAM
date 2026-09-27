@@ -52,12 +52,37 @@ class BIAMConfig:
         # 正则系数：λ1(ℓ2) 与 λ2(ℓ0)，对应论文 Eq.2 中的 λ1‖w‖₂² + λ2‖w‖₀
         self.lambda_l2 = 1e-3
         self.lambda_l0 = 1e-4
+
+        # BIAM² 成对门控 γ 的独立正则系数（未设置时退回全局 λ）：门控稀疏惩罚
+        # 需远强于全局 λ2，否则标签腐蚀下二阶容量会拟合离群标签
+        self.lambda_pair_l2 = 1e-2
+        self.lambda_pair_l0 = 5e-2
+
+        # BIAM² 门控的"保守开门"机制（标签腐蚀下防止二阶容量拟合离群标签）：
+        # - pair_warmup_epochs：前若干轮冻结门控（γ=0），让双层权重先识别离群样本
+        # - pair_gate_lr_scale：门控使用 lower_lr 的该比例，真交互梯度持续相干可积累，
+        #   离群驱动的开门被放缓（相对主效应慢约三倍）
+        # 双档门控调度（同一算法的两个工作点，见 0-PAPER.tex §3.4/§7）：
+        #   鲁棒档（本默认值）：用于 E1-E5 加性压力测试——数据腐蚀且不保证存在交互，
+        #     门控高度抑制。经 experiments/calibrate_pair_reg.py 第 2 轮校准：
+        #     E1/outlier30 mse 0.36（BIAM=1.57）、E6/int_clean AUPRC 0.75。
+        #   发现档（warmup=0, gate_lr_scale=1.0, lambda_pair_l0=l2=0）：用于 E6/E7
+        #     植入交互基准——实验设计保证真实交互存在，门控自由锁定（见 §7 协议）。
+        #     诊断实验 diag_eager_gates.py 证明：极端腐蚀下发现档门控失控
+        #     （outlier30 mse 52），故两档不可混用。
+        self.pair_warmup_epochs = 10
+        self.pair_gate_lr_scale = 0.3
         
         # 基函数类型：'piecewise_linear'（hinge, 论文默认）或 'piecewise_constant'（BIAM-H 消融）
         self.basis_type = 'piecewise_linear'
         
         # 是否启用缺失交互项 Σ α_{j,k,τ} I(m_j=1) h(x_k;η_τ)（BIAM-I 消融时置 False）
         self.use_missing_interactions = True
+
+        # BIAM² 特征-特征二阶交互（默认关闭保持 BIAM 行为；BIAM2 变体置 True）
+        self.use_feature_interactions = False
+        # 成对交互的秩-R CP 分解秩数
+        self.n_pair_ranks = 4
         
         # 是否启用双层优化（BIAM-B 消融时置 False，退化为固定均匀样本权重）
         self.use_bilevel = True

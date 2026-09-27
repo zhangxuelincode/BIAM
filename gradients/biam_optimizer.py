@@ -52,15 +52,30 @@ class BIAMOptimizer:
         """
         下层优化加性模型参数 w，上层优化加权网络参数 θ
         （论文使用一阶方法，SGD 无动量与公式一致）
+        BIAM² 门控 γ 使用 lower_lr × pair_gate_lr_scale 的独立参数组：
+        真交互的梯度持续且相干，小步长仍能积累；离群标签驱动的"爬行开门"被放缓
         """
+        gate_lr_scale = getattr(self.config, 'pair_gate_lr_scale', 1.0)
+        base_params, gate_params = [], []
+        for name, p in self.additive_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (gate_params if 'C_gate' in name else base_params).append(p)
+        lower_groups = [{'params': base_params, 'lr': self.lower_lr}]
+        if gate_params:
+            lower_groups.append({'params': gate_params, 'lr': self.lower_lr * gate_lr_scale})
+        self.lower_optimizer = optim.SGD(lower_groups)
+        self._gate_param_set = set(id(p) for p in gate_params)
+
         self.upper_optimizer = optim.SGD(
             self.weighting_network.parameters(),
             lr=self.upper_lr
         )
-        self.lower_optimizer = optim.SGD(
-            self.additive_model.parameters(),
-            lr=self.lower_lr
-        )
+
+    def _param_lr(self, param):
+        """参数对应的学习率（门控参数组用 lower_lr × pair_gate_lr_scale）"""
+        return self.lower_lr * getattr(self.config, 'pair_gate_lr_scale', 1.0) \
+            if id(param) in self._gate_param_set else self.lower_lr
     
     def _per_sample_loss(self, predictions, target):
         """
@@ -121,7 +136,8 @@ class BIAMOptimizer:
             virtual_params = {}
             for (name, p), g in zip(named_params.items(), grads):
                 if g is not None:
-                    virtual_params[name] = p - self.lower_lr * g
+                    # 虚拟步与真实下层更新保持一致的分组学习率
+                    virtual_params[name] = p - self._param_lr(p) * g
             
             # ---------- Step 3: 上层更新（超梯度经虚拟步回传）----------
             val_pred = torch.func.functional_call(self.additive_model, virtual_params, (xv,))
@@ -156,9 +172,15 @@ class BIAMOptimizer:
     def train_epoch(self, train_loader, val_loader, epoch):
         """
         训练一个 epoch：逐 batch 执行双层优化步
+        BIAM² 预热：前 pair_warmup_epochs 冻结成对交互（pair_active=False），
+        让双层权重先识别离群/失衡样本，之后门控再开始"保守开门"
         """
         self.biam_model.train()
         self.weighting_network.train()
+
+        warmup = getattr(self.config, 'pair_warmup_epochs', 0)
+        if hasattr(self.additive_model, 'pair_active'):
+            self.additive_model.pair_active = epoch >= warmup
         
         total_train_loss = 0.0
         total_val_loss = 0.0

@@ -41,6 +41,7 @@
 - **可解释的可加结构**：每个特征通过可学习的形状函数贡献输出，形状函数建立在位于数据分位数处的 hinge 基之上。
 - **一阶双层优化**（公式 4–6）：可微的*虚拟步*使得上层超梯度的计算足够廉价——无需二阶导数。
 - **强外推能力**：分段线性 hinge 形状函数的外推能力远优于分段常数替代方案。
+- **BIAM² 二阶扩展**：门控秩-R 成对交互曲面 `F_jk(x_j,x_k) = Σ_r u_jr(x_j)·u_kr(x_k)`，与主模型共用同一 hinge 基。零初始化门控配合 ℓ0 惩罚使得没有交互证据时成对项保持关闭，模型优雅退化为 BIAM；每个特征对输出可解释的交互强度 `s_jk = |γ̄_jk|·‖F_jk‖_F`，用于交互发现（交互排序 AUPRC）。
 
 ## 🔧 安装
 
@@ -147,6 +148,12 @@ BIAM/
 │   ├── biam_config.py            # 集中配置 + 校验
 │   └── biam_logger.py            # 结构化日志
 ├── visualization/                # 形状函数、特征重要性、训练曲线
+├── experiments/                  # 论文实验脚本（压力测试、绘图、可解释性）
+│   ├── run_new_experiments.py    # 合成压力测试协议（噪声族、极端场景）
+│   ├── run_extension_experiments.py  # 扩展场景与稳健基线
+│   ├── plot_new_results.py / plot_extension_results.py  # 结果图
+│   ├── interpretability_analysis.py  # 可解释性图（主效应、缺失偏移、响应曲面）
+│   └── generate_summary_csv.py   # 全部运行的 CSV 汇总
 └── tests/                        # 单元 / 功能 / 仿真 / 性能测试
 ```
 
@@ -182,6 +189,53 @@ $$
 | **缺失值** | MCAR / MAR / MNAR 掩码，比例 `missing_ratio` | 训练 / 验证 / 测试集 |
 | **干净测试标签** | 自然类别分布，无翻转标签 | 测试集 |
 
+## 📊 可解释性分析
+
+`experiments/interpretability_analysis.py` 生成论文中的定性分析图：由于 BIAM 是加性模型，每个预测都可分解为可解释的组成部分——各特征的形状函数、缺失指示偏移、以及缺失–特征交互响应曲面。该脚本直接从训练好的模型中提取各部分，并在合成数据上与真值进行对比。
+
+```bash
+# 生成全部四张图（合成 + 真实数据），PDF 用于论文、PNG 用于预览
+python experiments/interpretability_analysis.py
+
+# 仅生成真实数据图 / 仅生成合成数据图
+python experiments/interpretability_analysis.py --skip-synth
+python experiments/interpretability_analysis.py --skip-real
+```
+
+| 图 | 内容 |
+|--------|---------------|
+| `fig_interp_main_clean` | 干净合成数据下 8 个信息特征的形状函数：真值 vs BIAM vs NAM |
+| `fig_interp_main_outlier` | 10% 标签离群下同样的对比——形状恢复在腐蚀下依然成立 |
+| `fig_interp_missing` | MNAR 缺失指示偏移 $\phi_j$ 的恢复，以及缺失–特征条件响应曲面与 Bayes 曲面的对比 |
+| `fig_interp_real` | UCI Adult 人口普查数据中主要连续特征的贡献曲线（logit 尺度） |
+
+输出写入 `exp/interpretability/`（每张图同时输出 `.pdf` 与 `.png`），并附 `diagnostics.json`，记录测试 MSE / 准确率以及拟合曲线与真值曲线的逐特征相关系数。
+
+## 🧩 BIAM² 交互实验
+
+`experiments/run_biam2_experiments.py` 实现了参考 AG-NAM 协议设计的成对交互基准：在可加成分之上植入已知成对交互（乘积、sin 乘积、tanh 乘积），设置无交互对照（null）场景与 MCAR/MAR/MNAR 腐蚀，并采用交互发现指标（45 个候选特征对上的排序 AUPRC）。基线包含同样支持交互建模的 EBM 与 CatBoost。
+
+```bash
+# 回归（E6）+ 分类（E7）两个实验块；结果追加写入 exp/results_biam2_E{6,7}.csv
+python experiments/run_biam2_experiments.py
+
+# 交互分析图：逐对 MSE、恢复热图 + AUPRC、拟合交互曲面
+python experiments/plot_biam2_analysis.py
+```
+
+图输出到 `exp/biam2/`，并同步拷贝到论文项目的 `images/` 目录（`.pdf` + `.png`）。
+
+#### 双档门控调度
+
+BIAM² 门控提供**同一算法的两个工作点**（见论文 §3.4/§7 与 `utils/biam_config.py` 中的注释块）：
+
+| 调度档 | 配置 | 适用场景 | 依据 |
+|----------|----------|----------|-----------|
+| **鲁棒档**（默认） | `pair_warmup_epochs=10`、`pair_gate_lr_scale=0.3`、`lambda_pair_l0=5e-2`、`lambda_pair_l2=1e-2` | 加性压力测试（E1–E5）：标签腐蚀且不保证存在交互 | 保守开门使门控在腐蚀下保持关闭；经 `experiments/calibrate_pair_reg.py` 校准（E1/outlier30 MSE 0.36，BIAM 为 1.57） |
+| **发现档** | `pair_warmup_epochs=0`、`pair_gate_lr_scale=1.0`、`lambda_pair_l0=l2=0` | 植入交互基准（E6/E7） | 实验设计保证真实交互存在，门控自由锁定；AUPRC 0.54–0.87 |
+
+两档**不可混用**：`experiments/diag_eager_gates.py` 表明发现档在极端标签腐蚀下会对离群样本开门（outlier30 MSE ≈ 52），这正是鲁棒档要防止的失败模式。
+
 ## 🔬 消融变体
 
 | 变体 | 开关 | 移除的组件 |
@@ -209,6 +263,8 @@ $$
 | `use_bilevel` | `True` | `False` 关闭双层重加权（BIAM-B） |
 | `use_missing_interactions` | `True` | `False` 移除缺失 × 特征交互（BIAM-I） |
 | `lambda_l2` / `lambda_l0` | 1e-3 / 1e-4 | 形状函数的平滑 / 稀疏惩罚 |
+| `lambda_pair_l2` / `lambda_pair_l0` | 1e-2 / 5e-2 | BIAM² 成对门控 γ 的惩罚（鲁棒档） |
+| `pair_warmup_epochs` / `pair_gate_lr_scale` | 10 / 0.3 | 鲁棒档门控调度：预热冻结轮数与门控学习率比例 |
 | `upper_lr` / `lower_lr` | 0.1 / 0.05 | 上层（θ）与下层（w）学习率 |
 | `epochs` / `batch_size` | 200 / 64 | 训练安排 |
 | `seed` | 42 | 全局随机种子 |
@@ -234,9 +290,9 @@ python run_tests.py
 
 ## ☑️ 待办清单
 
-- [ ] 真实数据集基准测试（ADNI、UCI Adult、Credit）
+- [ ] 真实数据集基准测试（ADNI、Credit；UCI Adult 可解释性分析已完成）
 - [ ] GPU 加速与混合精度训练
-- [ ] 交互项的形状函数可视化
+- [x] 交互项的形状函数可视化（`experiments/interpretability_analysis.py`）
 - [ ] 双层学习率的自动超参搜索
 
 ## 🪪 许可证
